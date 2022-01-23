@@ -273,7 +273,9 @@ impl Listener {
             // asynchronous green threads and are executed concurrently.
             tokio::spawn(async move {
                 // Process the connection. If an error is encountered, log it.
-                if let Err(err) = handler.run().await {
+                use tracing::Instrument;
+                let span = tracing_texray::examine(tracing::trace_span!("mini-redis-server::Handler::run"));
+                if let Err(err) = handler.run().instrument(span).await {
                     error!(cause = ?err, "connection error");
                 }
             });

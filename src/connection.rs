@@ -53,6 +53,7 @@ impl Connection {
     /// On success, the received frame is returned. If the `TcpStream`
     /// is closed in a way that doesn't break a frame in half, it returns
     /// `None`. Otherwise, an error is returned.
+    #[tracing::instrument(skip(self))]
     pub async fn read_frame(&mut self) -> crate::Result<Option<Frame>> {
         loop {
             // Attempt to parse a frame from the buffered data. If enough data
