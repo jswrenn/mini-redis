@@ -5,12 +5,13 @@
 
 use crate::{Command, Connection, Db, DbDropGuard, Shutdown};
 
+use aws_sdk_cloudwatch::Client as CWClient;
 use std::future::Future;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, mpsc, Semaphore};
+use tokio::sync::{broadcast, mpsc, Mutex, Semaphore};
 use tokio::time::{self, Duration};
-use tracing::{debug, error, info, instrument};
+use tracing::{debug, error, info, instrument, trace};
 
 /// Server listener state. Created in the `run` call. It includes a `run` method
 /// which performs the TCP listening and initialization of per-connection state.
@@ -24,6 +25,9 @@ struct Listener {
     /// This holds a wrapper around an `Arc`. The internal `Db` can be
     /// retrieved and passed into the per connection state (`Handler`).
     db_holder: DbDropGuard,
+
+    /// CloudWatch API client.
+    cw_client: Arc<Mutex<CWClient>>,
 
     /// TCP listener supplied by the `run` caller.
     listener: TcpListener,
@@ -128,7 +132,7 @@ const MAX_CONNECTIONS: usize = 250;
 ///
 /// `tokio::signal::ctrl_c()` can be used as the `shutdown` argument. This will
 /// listen for a SIGINT signal.
-pub async fn run(listener: TcpListener, shutdown: impl Future) {
+pub async fn run(listener: TcpListener, cw_client: CWClient, shutdown: impl Future) {
     // When the provided `shutdown` future completes, we must send a shutdown
     // message to all active connections. We use a broadcast channel for this
     // purpose. The call below ignores the receiver of the broadcast pair, and when
@@ -141,6 +145,7 @@ pub async fn run(listener: TcpListener, shutdown: impl Future) {
     let mut server = Listener {
         listener,
         db_holder: DbDropGuard::new(),
+        cw_client:  Arc::new(Mutex::new(cw_client)),
         limit_connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
         notify_shutdown,
         shutdown_complete_tx,
@@ -226,39 +231,26 @@ impl Listener {
     async fn run(&mut self) -> crate::Result<()> {
         info!("accepting inbound connections");
 
-        let metrics = std::sync::Arc::new(tokio_metrics::TaskMetrics::new());
-        let m = metrics.clone();
-        tokio::spawn(async move {
-            // Poll the runtime metrics
-            let rt = tokio_metrics::RuntimeMetrics::new(&tokio::runtime::Handle::current());
-            let mut rt_sample = rt.sample();
+        use tokio_metrics::{RuntimeMetrics, TaskMetrics};
 
-            for sample in m.sample() {
-                let rt = rt_sample.next().unwrap();
+        let task_metrics = Arc::new(TaskMetrics::new());
 
-                if sample.num_scheduled > 0 {
-                    println!("\n\n### Tick:");
-                    println!("  sample: {:?}", sample);
-                    println!(
-                        "  mean time to first poll: {:?}",
-                        sample.mean_time_to_first_poll()
-                    );
-                    println!("  mean scheduled = {:?}", sample.mean_time_scheduled());
-                    println!("  mean fast poll = {:?}", sample.mean_fast_polls());
-                    println!("  mean slow poll = {:?}", sample.mean_slow_polls());
-                    println!("  fast poll % = {:?}", sample.fast_poll_ratio());
-                    // Runtime stats
-                    println!("  ~ runtime ~ ");
-                    println!("  mean polls per tick = {}", rt.mean_polls_per_park());
-                    println!("  busy ratio = {}", rt.busy_ratio());
-                    println!("  num parks = {}", rt.num_parks);
-                    println!("  max parks = {}", rt.max_parks);
-                    println!("  num steals = {}", rt.num_steals);
-                    println!("  ? = {:?}", rt);
-                }             
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-        });
+        // report runtime and task metrics every 100ms
+        {
+            let cw_client = self.cw_client.clone();
+            let task_metrics = task_metrics.clone();
+
+            tokio::spawn(async move {
+                let rt_metrics = RuntimeMetrics::new(&tokio::runtime::Handle::current());
+                for (rt_sample, task_sample) in rt_metrics.sample().zip(task_metrics.sample()) {
+                    if let Err(err) = report_metrics(&cw_client, rt_sample, task_sample).await {
+                        error!(cause = ?err, "metrics reporting error");
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                crate::Result::Ok(())
+            });
+        }
 
         loop {
             // Wait for a permit to become available
@@ -305,7 +297,7 @@ impl Listener {
 
             // Spawn a new task to process the connections. Tokio tasks are like
             // asynchronous green threads and are executed concurrently.
-            tokio::spawn(metrics.instrument(async move {
+            tokio::spawn(task_metrics.instrument(async move {
                 // Process the connection. If an error is encountered, log it.
                 if let Err(err) = handler.run().await {
                     error!(cause = ?err, "connection error");
@@ -429,4 +421,87 @@ impl Drop for Handler {
         // semaphore.
         self.limit_connections.add_permits(1);
     }
+}
+
+/// Push metrics to CloudWatch.
+async fn report_metrics(
+    client: &Arc<Mutex<CWClient>>,
+    runtime: tokio_metrics::runtime::Sample,
+    task: tokio_metrics::task::Sample,
+) -> Result<(), aws_sdk_cloudwatch::Error>
+{
+    trace!("reporting metics: runtime={:#?}, task={:#?}", runtime, task);
+
+    use aws_sdk_cloudwatch::model::{MetricDatum, StandardUnit};
+
+    client.lock().await.put_metric_data()
+        .namespace("mini-redis-server")
+
+        // runtime metrics
+
+        .metric_data(MetricDatum::builder()
+            .metric_name("mean_polls_per_park")
+            .unit(StandardUnit::Count)
+            .values(runtime.mean_polls_per_park() as f64).build())
+
+        .metric_data(MetricDatum::builder()
+            .metric_name("busy_ratio")
+            .unit(StandardUnit::Count)
+            .values(runtime.busy_ratio() as f64).build())
+
+        .metric_data(MetricDatum::builder()
+            .metric_name("num_parks")
+            .unit(StandardUnit::Count)
+            .values(runtime.num_parks as f64).build())
+
+        .metric_data(MetricDatum::builder()
+            .metric_name("max_parks")
+            .unit(StandardUnit::Count)
+            .values(runtime.max_parks as f64).build())
+
+        .metric_data(MetricDatum::builder()
+            .metric_name("num_steals")
+            .unit(StandardUnit::Count)
+            .values(runtime.num_steals as f64).build())
+
+        // task metrics
+
+        .metric_data(MetricDatum::builder()
+            .metric_name("num_tasks")
+            .unit(StandardUnit::Count)
+            .values(task.num_tasks as f64).build())
+
+        .metric_data(MetricDatum::builder()
+            .metric_name("num_scheduled")
+            .unit(StandardUnit::Count)
+            .values(task.num_scheduled as f64).build())
+
+        .metric_data(MetricDatum::builder()
+            .metric_name("num_fast_polls")
+            .unit(StandardUnit::Count)
+            .values(task.num_fast_polls as f64).build())
+
+        .metric_data(MetricDatum::builder()
+            .metric_name("num_slow_polls")
+            .unit(StandardUnit::Count)
+            .values(task.num_slow_polls as f64).build())
+
+        .metric_data(MetricDatum::builder()
+            .metric_name("mean_time_to_first_poll")
+            .unit(StandardUnit::Microseconds)
+            .values(task.mean_time_to_first_poll().as_micros() as f64).build())
+
+        .metric_data(MetricDatum::builder()
+            .metric_name("mean_fast_polls")
+            .unit(StandardUnit::Microseconds)
+            .values(task.mean_fast_polls().as_micros() as f64).build())
+
+        .metric_data(MetricDatum::builder()
+            .metric_name("mean_slow_polls")
+            .unit(StandardUnit::Microseconds)
+            .values(task.mean_slow_polls().as_micros() as f64).build())
+
+        .send().await?;
+
+        Ok(())
 }

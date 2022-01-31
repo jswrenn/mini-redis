@@ -8,6 +8,8 @@
 
 use mini_redis::{server, DEFAULT_PORT};
 
+use aws_config::meta::region::RegionProviderChain;
+use aws_sdk_cloudwatch::{Client as CWClient, Region};
 use structopt::StructOpt;
 use tokio::net::TcpListener;
 use tokio::signal;
@@ -24,7 +26,15 @@ pub async fn main() -> mini_redis::Result<()> {
     // Bind a TCP listener
     let listener = TcpListener::bind(&format!("127.0.0.1:{}", port)).await?;
 
-    server::run(listener, signal::ctrl_c()).await;
+    // Construct a CloudWatch client
+    let region_provider = RegionProviderChain::first_try(cli.region.map(Region::new))
+        .or_default_provider()
+        .or_else(Region::new("us-west-2"));
+
+    let shared_config = aws_config::from_env().region(region_provider).load().await;
+    let cw_client = CWClient::new(&shared_config);
+
+    server::run(listener, cw_client, signal::ctrl_c()).await;
 
     Ok(())
 }
@@ -34,4 +44,8 @@ pub async fn main() -> mini_redis::Result<()> {
 struct Cli {
     #[structopt(name = "port", long = "--port")]
     port: Option<String>,
+
+    /// The AWS Region.
+    #[structopt(short, long)]
+    region: Option<String>,
 }

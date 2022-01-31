@@ -30,8 +30,13 @@ tokio-stream = "0.1"
 tracing = "0.1.13"
 tracing-futures = { version = "0.2.3" }
 tracing-subscriber = "0.2.2"
+aws-sdk-cloudwatch = "0.6.0"
+aws-config = "0.6.0"
 
 tokio-metrics = { path = "../tokio-metrics", features = ["rt"] }
+
+[patch.crates-io]
+tokio = { git = "https://github.com/tokio-rs/tokio", branch = "master" }
 
 [dev-dependencies]
 # Enable test-utilities in dev mode only. This is mostly for tests.
