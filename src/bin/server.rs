@@ -11,12 +11,19 @@ use mini_redis::{server, DEFAULT_PORT};
 use structopt::StructOpt;
 use tokio::net::TcpListener;
 use tokio::signal;
+use tracing_subscriber::prelude::*;
 
 #[tokio::main]
 pub async fn main() -> mini_redis::Result<()> {
     // enable logging
     // see https://docs.rs/tracing for more info
-    tracing_subscriber::fmt::try_init()?;
+    let console_layer = console_subscriber::spawn();
+    let stdout_layer = tracing_subscriber::fmt::layer();
+
+    tracing_subscriber::registry()
+        .with(console_layer)
+        .with(stdout_layer)
+        .init();
 
     let cli = Cli::from_args();
     let port = cli.port.as_deref().unwrap_or(DEFAULT_PORT);

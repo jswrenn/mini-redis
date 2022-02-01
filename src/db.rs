@@ -33,6 +33,9 @@ pub(crate) struct Db {
     /// Handle to shared state. The background task will also have an
     /// `Arc<Shared>`.
     shared: Arc<Shared>,
+    
+    /// db
+    resource_span: tracing::Span,
 }
 
 #[derive(Debug)]
@@ -106,6 +109,7 @@ struct Entry {
 impl DbDropGuard {
     /// Create a new `DbHolder`, wrapping a `Db` instance. When this is dropped
     /// the `Db`'s purge task will be shut down.
+    #[track_caller]
     pub(crate) fn new() -> DbDropGuard {
         DbDropGuard { db: Db::new() }
     }
@@ -127,7 +131,20 @@ impl Drop for DbDropGuard {
 impl Db {
     /// Create a new, empty, `Db` instance. Allocates shared state and spawns a
     /// background task to manage key expiration.
+    #[track_caller]
     pub(crate) fn new() -> Db {
+        let resource_span = {
+            let location = std::panic::Location::caller();
+            tracing::trace_span!(
+                "runtime.resource",
+                concrete_type = "Mutex",
+                kind = "Sync",
+                loc.file = location.file(),
+                loc.line = location.line(),
+                loc.col = location.column(),
+            )
+        };
+
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 entries: HashMap::new(),
@@ -142,7 +159,52 @@ impl Db {
         // Start the background task.
         tokio::spawn(purge_expired_tasks(shared.clone()));
 
-        Db { shared }
+        Db { shared, resource_span }
+    }
+
+    #[tracing::instrument(skip(self))]
+    fn lock(&self) -> std::sync::MutexGuard<State> {
+        loop {
+            match self.shared.state.try_lock() {
+                Ok(guard) => return guard,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    self.resource_span.in_scope(|| {
+                        tracing::trace!(
+                            target: "runtime::resource::state_update",
+                            blocks = 1i64,
+                            blocked.op = "add",
+                        );
+                    });
+                },
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    panic!("poisoned!");
+                }
+            }
+        }
+    }
+
+    fn with_state<F, R>(&self, source: &'static str, f: F) -> R
+    where
+        F: FnOnce(std::sync::MutexGuard<State>) -> R
+    {
+        self.resource_span.in_scope(|| {
+            tracing::trace!(
+                target: "runtime::resource::state_update",
+                locks = 1u64,
+                locks.op = "add",
+            );
+            
+            let state = self.lock();
+            let locked_span =
+                tracing::trace_span!("runtime.resource.async_op",
+                    source = source,
+                    inherits_child_attrs = false);
+            
+            let async_op_poll_span = 
+                tracing::trace_span!("runtime.resource.async_op.poll");
+        
+            locked_span.in_scope(|| async_op_poll_span.in_scope(|| f(state)))
+        })
     }
 
     /// Get the value associated with a key.
@@ -150,27 +212,23 @@ impl Db {
     /// Returns `None` if there is no value associated with the key. This may be
     /// due to never having assigned a value to the key or a previously assigned
     /// value expired.
+    #[tracing::instrument(skip(self))]
     pub(crate) fn get(&self, key: &str) -> Option<Bytes> {
         // Acquire the lock, get the entry and clone the value.
         //
         // Because data is stored using `Bytes`, a clone here is a shallow
         // clone. Data is not copied.
-        let state = self.shared.state.lock().unwrap();
-        state.entries.get(key).map(|entry| entry.data.clone())
+        self.with_state("Db::get", |state| {
+            state.entries.get(key).map(|entry| entry.data.clone())
+        })
     }
 
     /// Set the value associated with a key along with an optional expiration
     /// Duration.
     ///
     /// If a value is already associated with the key, it is removed.
+    #[tracing::instrument(skip(self))]
     pub(crate) fn set(&self, key: String, value: Bytes, expire: Option<Duration>) {
-        let mut state = self.shared.state.lock().unwrap();
-
-        // Get and increment the next insertion ID. Guarded by the lock, this
-        // ensures a unique identifier is associated with each `set` operation.
-        let id = state.next_id;
-        state.next_id += 1;
-
         // If this `set` becomes the key that expires **next**, the background
         // task needs to be notified so it can update its state.
         //
@@ -178,48 +236,55 @@ impl Db {
         // `set` routine.
         let mut notify = false;
 
-        let expires_at = expire.map(|duration| {
-            // `Instant` at which the key expires.
-            let when = Instant::now() + duration;
+        self.with_state("Db::set", |mut state| {
+            // Get and increment the next insertion ID. Guarded by the lock, this
+            // ensures a unique identifier is associated with each `set` operation.
+            let id = state.next_id;
+            state.next_id += 1;
 
-            // Only notify the worker task if the newly inserted expiration is the
-            // **next** key to evict. In this case, the worker needs to be woken up
-            // to update its state.
-            notify = state
-                .next_expiration()
-                .map(|expiration| expiration > when)
-                .unwrap_or(true);
+            let expires_at = expire.map(|duration| {
+                // `Instant` at which the key expires.
+                let when = Instant::now() + duration;
 
-            // Track the expiration.
-            state.expirations.insert((when, id), key.clone());
-            when
-        });
+                // Only notify the worker task if the newly inserted expiration is the
+                // **next** key to evict. In this case, the worker needs to be woken up
+                // to update its state.
+                notify = state
+                    .next_expiration()
+                    .map(|expiration| expiration > when)
+                    .unwrap_or(true);
 
-        // Insert the entry into the `HashMap`.
-        let prev = state.entries.insert(
-            key,
-            Entry {
-                id,
-                data: value,
-                expires_at,
-            },
-        );
+                // Track the expiration.
+                state.expirations.insert((when, id), key.clone());
+                when
+            });
 
-        // If there was a value previously associated with the key **and** it
-        // had an expiration time. The associated entry in the `expirations` map
-        // must also be removed. This avoids leaking data.
-        if let Some(prev) = prev {
-            if let Some(when) = prev.expires_at {
-                // clear expiration
-                state.expirations.remove(&(when, prev.id));
+            // Insert the entry into the `HashMap`.
+            let prev = state.entries.insert(
+                key,
+                Entry {
+                    id,
+                    data: value,
+                    expires_at,
+                },
+            );
+
+            // If there was a value previously associated with the key **and** it
+            // had an expiration time. The associated entry in the `expirations` map
+            // must also be removed. This avoids leaking data.
+            if let Some(prev) = prev {
+                if let Some(when) = prev.expires_at {
+                    // clear expiration
+                    state.expirations.remove(&(when, prev.id));
+                }
             }
-        }
 
-        // Release the mutex before notifying the background task. This helps
-        // reduce contention by avoiding the background task waking up only to
-        // be unable to acquire the mutex due to this function still holding it.
-        drop(state);
-
+            // Release the mutex before notifying the background task. This helps
+            // reduce contention by avoiding the background task waking up only to
+            // be unable to acquire the mutex due to this function still holding it.
+            drop(state);
+        });
+        
         if notify {
             // Finally, only notify the background task if it needs to update
             // its state to reflect a new expiration.
