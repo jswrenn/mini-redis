@@ -11,6 +11,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, Semaphore};
 use tokio::time::{self, Duration};
 use tracing::{debug, error, info, instrument};
+use tracing::Instrument;
 
 /// Server listener state. Created in the `run` call. It includes a `run` method
 /// which performs the TCP listening and initialization of per-connection state.
@@ -273,7 +274,10 @@ impl Listener {
             // asynchronous green threads and are executed concurrently.
             tokio::spawn(async move {
                 // Process the connection. If an error is encountered, log it.
-                if let Err(err) = handler.run().await {
+                let span = tracing::trace_span!("handler.run()");
+                tracking_allocator::AllocationGroupToken::register()
+                    .map(|token| token.attach_to_span(&span));
+                if let Err(err) = handler.run().instrument(span).await {
                     error!(cause = ?err, "connection error");
                 }
             });
