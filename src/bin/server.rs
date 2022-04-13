@@ -16,7 +16,10 @@ use tokio::signal;
 pub async fn main() -> mini_redis::Result<()> {
     // enable logging
     // see https://docs.rs/tracing for more info
-    tracing_subscriber::fmt::try_init()?;
+    use tracing_subscriber::{registry::Registry, prelude::*};
+    let _subscriber = Registry::default()
+        .with(tracing_xray::Layer)
+        .init();
 
     let cli = Cli::from_args();
     let port = cli.port.as_deref().unwrap_or(DEFAULT_PORT);
