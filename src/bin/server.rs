@@ -18,7 +18,7 @@ pub async fn main() -> mini_redis::Result<()> {
     // see https://docs.rs/tracing for more info
     use tracing_subscriber::{registry::Registry, prelude::*};
     let _subscriber = Registry::default()
-        .with(tracing_xray::Layer)
+        .with(tracing_xray::Layer::new().await?)
         .init();
 
     let cli = Cli::from_args();
