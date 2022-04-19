@@ -1,11 +1,23 @@
-# mini-redis
+# mini-redis (X-Ray edition)
 
 `mini-redis` is an incomplete, idiomatic implementation of a
 [Redis](https://redis.io) client and server built with
 [Tokio](https://tokio.rs).
 
-The intent of this project is to provide a larger example of writing a Tokio
-application.
+This branch of mini-redis uses the [tracing-xray] crate to propogate traces to
+the AWS X-Ray daemon. **To get started:**
+1. clone https://github.com/jswrenn/tracing-xray
+2. clone mini-redis (this branch https://github.com/jswrenn/mini-redis/tree/tracing-xray) adjacent to the tracing-xray folder
+3. run `cargo run --bin mini-redis-server`
+4. in another terminal, run `redis-benchmark -t get,set -n 1` (you can increase the number to create more load)
+
+[tracing-xray]: https://github.com/jswrenn/tracing-xray
+
+To benchmark `mini-redis-server`:
+1. without tracing
+2. with tracing and the `Registry` subscriber
+3. with tracing, the `Registry` subscriber, and the `X-Ray` layer
+run `./bench.sh`.
 
 **Disclaimer** Please don't use mini-redis in production. This project is
 intended to be a learning resource, and omits various parts of the Redis

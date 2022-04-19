@@ -124,7 +124,7 @@ impl Set {
     ///
     /// The response is written to `dst`. This is called by the server in order
     /// to execute a received command.
-    #[instrument(skip(self, db, dst))]
+    #[cfg_attr(feature = "tracing", instrument(skip(self, db, dst)))]
     pub(crate) async fn apply(self, db: &Db, dst: &mut Connection) -> crate::Result<()> {
         // Set the value in the shared database state.
         db.set(self.key, self.value, self.expire);

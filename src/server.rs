@@ -326,8 +326,12 @@ impl Handler {
     ///
     /// When the shutdown signal is received, the connection is processed until
     /// it reaches a safe state, at which point it is terminated.
-    #[instrument(skip(self), fields(
-        AWS_XRAY_TRACE_ID = &tracing_xray::trace_id::new().as_str(),
+    #[cfg_attr(feature = "tracing", instrument(
+        name="run",
+        skip(self), 
+        fields(
+            aws.xray.trace_id = &tracing_xray::trace_id::new().as_str(),
+        ),
     ))]
     async fn run(&mut self) -> crate::Result<()> {
         // As long as the shutdown signal has not been received, try to read a

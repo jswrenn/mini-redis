@@ -99,6 +99,7 @@ impl Subscribe {
     /// are updated accordingly.
     ///
     /// [here]: https://redis.io/topics/pubsub
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip(self, db, dst, shutdown)))]
     pub(crate) async fn apply(
         mut self,
         db: &Db,

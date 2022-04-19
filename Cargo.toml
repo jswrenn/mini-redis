@@ -35,3 +35,8 @@ tracing-xray = { path = "../tracing-xray" }
 [dev-dependencies]
 # Enable test-utilities in dev mode only. This is mostly for tests.
 tokio = { version = "1", features = ["test-util"] }
+
+[features]
+default = ["xray"]
+xray = ["tracing"]
+tracing = []

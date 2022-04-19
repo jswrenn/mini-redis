@@ -17,8 +17,14 @@ pub async fn main() -> mini_redis::Result<()> {
     // enable logging
     // see https://docs.rs/tracing for more info
     use tracing_subscriber::{registry::Registry, prelude::*};
+    
+    #[cfg(all(feature = "xray"))]
     let _subscriber = Registry::default()
-        .with(tracing_xray::Layer::new().await?)
+        .with(tracing_xray::Layer::new("mini-redis-server".to_owned()).await?)
+        .init();
+
+    #[cfg(all(feature = "tracing", not(feature = "xray")))]
+    let _subscriber = Registry::default()
         .init();
 
     let cli = Cli::from_args();
